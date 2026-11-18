@@ -1,10 +1,14 @@
+import base64
 import os
 import hashlib
+import msgpack
 import tempfile
 import unittest
 
 import vivisect
 import vivisect.storage.basicfile as vsbf
+import vivisect.storage.mpfile as vsmp
+import vivisect.parsers as v_parsers
 from vivisect.const import *
 
 
@@ -153,3 +157,157 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(vw.getLocation(0x6105), (0x6105, 3, 5, None))
         self.assertEqual(vw.getLocation(0x610a), (0x610a, 3, 5, None))
 
+    def _getWorkspace(self, filename, module='vivisect.storage.mpfile'):
+        vw = vivisect.VivWorkspace()
+        vw.setMeta('Architecture', 'i386')
+        vw.setMeta('Format', 'pe')
+        vw.setMeta('StorageName', filename)
+        vw.setMeta('StorageModule', module)
+        return vw
+
+    def _reload(self, filename, module='vivisect.storage.mpfile'):
+        vw = vivisect.VivWorkspace()
+        vw.setMeta('StorageModule', module)
+        vw.loadWorkspace(filename)
+        return vw
+
+    def test_mpfile_first_save_has_header(self):
+        mpfile = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            vw = self._getWorkspace(mpfile.name)
+            add_events(vw)
+            # An incremental save against a brand new file must still write
+            # the signature, otherwise the file is guessed to be a blob.
+            vw.saveWorkspace(False)
+
+            with open(mpfile.name, 'rb') as f:
+                self.assertEqual(next(msgpack.Unpacker(f, raw=False)), 'MSGVIV\x00\x00')
+
+            self.assertEqual(v_parsers.guessFormatFilename(mpfile.name), 'mpviv')
+
+            # and the events must survive the round trip
+            ovw = self._reload(mpfile.name)
+            self.assertEqual(ovw.getLocation(0x3000), (0x3000, 16, 6, 'oogieboogie'))
+            self.assertEqual(ovw.getMeta('foo'), 'bar')
+        finally:
+            mpfile.close()
+            os.unlink(mpfile.name)
+
+    def test_mpfile_full_and_incremental_equivalent(self):
+        fulld = tempfile.mkdtemp()
+        incd = tempfile.mkdtemp()
+        fullname = os.path.join(fulld, 'full.mviv')
+        incname = os.path.join(incd, 'inc.mviv')
+        try:
+            # the same events arrived at two ways: a single full save, and an
+            # initial incremental save followed by appended changes
+            fvw = self._getWorkspace(fullname)
+            add_events(fvw)
+            fvw.saveWorkspace(True)
+
+            ivw = self._getWorkspace(incname)
+            ivw.saveWorkspace(False)
+            add_events(ivw)
+            ivw.saveWorkspace(False)
+
+            fnew = self._reload(fullname)
+            inew = self._reload(incname)
+            # StorageName/StorageModule necessarily differ between the two
+            # files; everything else must be identical.
+            ignore = ('StorageName', 'StorageModule')
+            fevts = [e for e in fnew.exportWorkspace() if not (e[0] == VWE_SETMETA and e[1][0] in ignore)]
+            inevts = [e for e in inew.exportWorkspace() if not (e[0] == VWE_SETMETA and e[1][0] in ignore)]
+            self.assertEqual(fevts, inevts)
+        finally:
+            for name in (fullname, incname):
+                if os.path.exists(name):
+                    os.unlink(name)
+            os.rmdir(fulld)
+            os.rmdir(incd)
+
+    def test_mpfile_align_roundtrip(self):
+        mpfile = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            vw = self._getWorkspace(mpfile.name)
+            # the map is 0x1234 real bytes but aligned out to 0x2000
+            vw.addMemoryMap(0x1000, 7, 'testfile', b'\x11' * 0x1234, align=0x2000)
+            vw.saveWorkspace(True)
+
+            # append a map which also requires alignment
+            vw.addMemoryMap(0x4000, 7, 'testfile', b'\x22' * 0x1234, align=0x2000)
+            vw.saveWorkspace(False)
+
+            ovw = self._reload(mpfile.name)
+            self.assertEqual(ovw.getMemoryMaps(), [(0x1000, 0x2000, 7, 'testfile'),
+                                                   (0x4000, 0x2000, 7, 'testfile')])
+            # this address only exists because align was preserved
+            self.assertEqual(ovw.readMemory(0x5ffc, 4), b'\x00\x00\x00\x00')
+            self.assertEqual(ovw.readMemory(0x1230, 4), b'\x11\x11\x11\x11')
+        finally:
+            mpfile.close()
+            os.unlink(mpfile.name)
+
+    def test_mpfile_binary_payloads(self):
+        mpfile = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            vw = self._getWorkspace(mpfile.name)
+            payload = bytes(range(256))
+            vw.addMemoryMap(0x1000, 7, 'testfile', b'\x00' * 0x1000)
+            vw.writeMemory(0x1004, payload)
+            vw.setMeta('BinaryMeta', payload)
+            vw.setMeta('FileBytes', v_parsers.compressBytes(payload * 4))
+            vw.saveWorkspace(True)
+
+            ovw = self._reload(mpfile.name)
+            self.assertEqual(ovw.readMemory(0x1004, len(payload)), payload)
+            self.assertEqual(ovw.getMeta('BinaryMeta'), payload)
+            self.assertEqual(ovw.getMeta('FileBytes'), v_parsers.compressBytes(payload * 4))
+        finally:
+            mpfile.close()
+            os.unlink(mpfile.name)
+
+    def test_mpfile_legacy_quad(self):
+        # a file written by an older vivisect: no align in the ADDMMAP event
+        # payload, and binary strings packed without the bin type
+        mpfile = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            events = [
+                (VWE_SETMETA, ('Architecture', 'i386')),
+                (VWE_SETMETA, ('Format', 'pe')),
+                (VWE_ADDFILE, ('testfile', 0x1000, hashlib.md5(b'testfile').hexdigest())),
+                (VWE_ADDMMAP, (0x1000, 7, 'testfile', base64.b64encode(b'\xee' * 0x1234))),
+                (VWE_SETMETA, ('StorageName', mpfile.name)),
+            ]
+            with open(mpfile.name, 'wb') as f:
+                msgpack.pack(vsmp.VSIG, f, use_bin_type=False)
+                for event in events:
+                    msgpack.pack(event, f, use_bin_type=False)
+
+            ovw = self._reload(mpfile.name)
+            self.assertEqual(ovw.getMemoryMaps(), [(0x1000, 0x1234, 7, 'testfile')])
+            self.assertEqual(ovw.readMemory(0x1230, 4), b'\xee\xee\xee\xee')
+        finally:
+            mpfile.close()
+            os.unlink(mpfile.name)
+
+    def test_mpfile_headerless_incremental(self):
+        # files written by the old incremental-save bug lack a signature;
+        # they are still workspaces so they must still load
+        mpfile = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            vw = self._getWorkspace(mpfile.name)
+            add_events(vw)
+            events = vw.exportWorkspace()
+            with open(mpfile.name, 'wb') as f:
+                for event in events:
+                    if event[0] == VWE_ADDMMAP:
+                        event = (event[0], (event[1][0], event[1][1], event[1][2],
+                                            base64.b64encode(event[1][3]), event[1][4]))
+                    msgpack.pack(event, f, use_bin_type=True)
+
+            ovw = self._reload(mpfile.name)
+            self.assertEqual(ovw.getMeta('foo'), 'bar')
+            self.assertEqual(ovw.getLocation(0x3000), (0x3000, 16, 6, 'oogieboogie'))
+        finally:
+            mpfile.close()
+            os.unlink(mpfile.name)

@@ -9,8 +9,7 @@ def writeFileHeader(f):
 
 def saveWorkspaceChanges(vw, filename):
     elist = vw.exportWorkspaceChanges()
-    if len(elist):
-        vivEventsAppendFile(filename, elist)
+    vivEventsAppendFile(filename, elist)
 
 def saveWorkspace(vw, filename):
     events = vw.exportWorkspace()
@@ -19,11 +18,13 @@ def saveWorkspace(vw, filename):
 
 def vivEventsAppendFile(filename, events):
     with open(filename, 'ab') as f:
-        # if the file is empty, add the header
+        # if the file is empty, add the header (this also covers the case
+        # of a first save which is an incremental one)
         if f.tell() == 0:
             writeFileHeader(f)
 
-        pickle.dump(events, f, protocol=2)
+        if len(events):
+            pickle.dump(events, f, protocol=2)
 
 
 def vivEventsToFile(filename, events):
